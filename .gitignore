@@ -1,0 +1,9 @@
+build/
+dist/
+out/
+*.log
+*.ini
+!config/gemini-proxy.ini.example
+.vs/
+.vscode/
+CMakeUserPresets.json
