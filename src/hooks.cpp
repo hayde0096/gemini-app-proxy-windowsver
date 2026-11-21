@@ -664,13 +664,23 @@ bool InstallHooks() {
     ok &= CreateHookByName(ws2, "WSAEnumNetworkEvents", reinterpret_cast<void*>(&DetourWSAEnumNetworkEvents), &g_origWSAEnumNetworkEvents);
     ok &= CreateHookByName(ws2, "closesocket", reinterpret_cast<void*>(&DetourCloseSocket), &g_origCloseSocket);
 
-    // Fake-IP DNS hooks
+    // Fake-IP DNS hooks (skip duplicate hook when FreeAddrInfoW aliases freeaddrinfo in ws2_32.dll)
     CreateHookByName(ws2, "getaddrinfo", reinterpret_cast<void*>(&DetourGetAddrInfoA), &g_origGetAddrInfoA);
     CreateHookByName(ws2, "GetAddrInfoW", reinterpret_cast<void*>(&DetourGetAddrInfoW), &g_origGetAddrInfoW);
     CreateHookByName(ws2, "GetAddrInfoExW", reinterpret_cast<void*>(&DetourGetAddrInfoExW), &g_origGetAddrInfoExW);
-    CreateHookByName(ws2, "freeaddrinfo", reinterpret_cast<void*>(&DetourFreeAddrInfoA), &g_origFreeAddrInfoA);
-    CreateHookByName(ws2, "FreeAddrInfoW", reinterpret_cast<void*>(&DetourFreeAddrInfoW), &g_origFreeAddrInfoW);
-    CreateHookByName(ws2, "FreeAddrInfoExW", reinterpret_cast<void*>(&DetourFreeAddrInfoExW), &g_origFreeAddrInfoExW);
+
+    FARPROC pFreeA = GetProcAddress(ws2, "freeaddrinfo");
+    FARPROC pFreeW = GetProcAddress(ws2, "FreeAddrInfoW");
+    FARPROC pFreeExW = GetProcAddress(ws2, "FreeAddrInfoExW");
+    if (pFreeA) {
+        CreateHookByName(ws2, "freeaddrinfo", reinterpret_cast<void*>(&DetourFreeAddrInfoA), &g_origFreeAddrInfoA);
+    }
+    if (pFreeW && pFreeW != pFreeA) {
+        CreateHookByName(ws2, "FreeAddrInfoW", reinterpret_cast<void*>(&DetourFreeAddrInfoW), &g_origFreeAddrInfoW);
+    }
+    if (pFreeExW && pFreeExW != pFreeA && pFreeExW != pFreeW) {
+        CreateHookByName(ws2, "FreeAddrInfoExW", reinterpret_cast<void*>(&DetourFreeAddrInfoExW), &g_origFreeAddrInfoExW);
+    }
 
     st = MH_EnableHook(MH_ALL_HOOKS);
     if (st != MH_OK) {

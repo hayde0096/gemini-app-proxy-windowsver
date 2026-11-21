@@ -46,7 +46,7 @@ irm https://raw.githubusercontent.com/hayde0096/gemini-app-proxy-windowsver/main
 - **支持 SOCKS5 & HTTP CONNECT**：兼容 Clash / Mihomo / v2rayN / sing-box 等常见本地代理端口，支持用户名/密码认证。
 - **覆盖全子进程**：自动拦截 Electron 主进程（Node.js `libuv` / `ConnectEx`）与 Chromium `NetworkService` 进程（`connect` / `WSAConnect`），并跳过 Renderer / GPU 进程以保持零开销。
 - **自动阻断 QUIC (UDP 443)**：防止 Chromium 通过 HTTP/3 (UDP) 绕过代理，强制平滑回退到 TCP 走代理通道。
-- **防本地 DNS 污染（Remote DNS）**：被动缓存 `getaddrinfo` / `GetAddrInfoW` / `GetAddrInfoExW` 的 `IP -> 域名` 映射，向 SOCKS5（`ATYP=0x03`）或 HTTP `CONNECT` 直接发送真实域名由远端代理解析。
+- **防本地 DNS 污染（Fake-IP + Remote DNS）**：自动拦截 Chromium 内置 UDP 53 DNS 并回退至系统解析，通过 `198.18.x.x` 虚拟 IP（Fake-IP）映射真实域名，向 SOCKS5（`ATYP=0x03`）或 HTTP `CONNECT` 直接发送域名由远端代理解析。
 - **配置跨更新保留**：默认将 `gemini-proxy.ini` 放在 `%LocalAppData%\Google\Gemini\` 根目录，Gemini 升级 `app-x.y.z` 后只需重新执行一键安装即可无缝恢复。
 
 ---
