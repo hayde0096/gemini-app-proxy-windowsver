@@ -93,14 +93,21 @@ New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 $tempDll = Join-Path $tempDir "version.dll"
 $tempSum = Join-Path $tempDir "SHA256SUMS.txt"
 
+$dlProxy = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $env:HTTP_PROXY } elseif ($env:GEMINI_PROXY -match '^https?://') { $env:GEMINI_PROXY } else { $null }
+$iwrCommon = @{ UseBasicParsing = $true }
+if ($dlProxy) {
+    $iwrCommon["Proxy"] = $dlProxy
+    Write-Host "[*] Using download proxy: $dlProxy" -ForegroundColor DarkGray
+}
+
 try {
     Write-Host "[*] Downloading version.dll ($Version)..." -ForegroundColor Cyan
     Write-Host "    URL: $dllUrl" -ForegroundColor DarkGray
-    Invoke-WebRequest -Uri $dllUrl -OutFile $tempDll -UseBasicParsing
+    Invoke-WebRequest -Uri $dllUrl -OutFile $tempDll @iwrCommon
 
     # Optional SHA256 verification
     try {
-        Invoke-WebRequest -Uri $hashUrl -OutFile $tempSum -UseBasicParsing
+        Invoke-WebRequest -Uri $hashUrl -OutFile $tempSum @iwrCommon
         $expectedLine = Get-Content $tempSum | Where-Object { $_ -match '\bversion\.dll$' } | Select-Object -First 1
         if ($expectedLine) {
             $expectedHash = ($expectedLine -split '\s+')[0].ToLower()

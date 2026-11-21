@@ -13,6 +13,9 @@
 ```powershell
 # 交互式安装（自动从 GitHub Release 下载最新 version.dll 并校验 SHA256）
 irm https://raw.githubusercontent.com/hayde0096/gemini-app-proxy-windowsver/main/scripts/install.ps1 | iex
+
+# 若终端未开启系统全局代理，可直接通过 -Proxy 指定本地 HTTP 代理拉取并安装（如 1080 / 7890 / 7897）
+$env:HTTPS_PROXY="http://127.0.0.1:1080"; irm -Proxy $env:HTTPS_PROXY https://raw.githubusercontent.com/hayde0096/gemini-app-proxy-windowsver/main/scripts/install.ps1 | iex
 ```
 
 如需一步指定代理地址（非交互模式）：
