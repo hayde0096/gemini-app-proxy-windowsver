@@ -9,9 +9,13 @@
 #include <ws2tcpip.h>
 #include <mswsock.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace gproxy {
 
@@ -35,10 +39,27 @@ struct HookGuard {
     }
 };
 
-// Passive DNS cache: IP string -> resolved hostname (used for remote DNS over SOCKS5/HTTP)
+// Fake-IP allocator (198.18.0.1 - 198.19.255.254, RFC 2544 benchmarking range)
+// Eliminates local DNS poisoning & collisions by mapping each domain to a unique synthetic IPv4,
+// then passing the real domain name to the SOCKS5/HTTP proxy for remote DNS resolution.
 std::mutex g_dnsMutex;
-std::unordered_map<std::string, std::string> g_ipToHost;
-constexpr size_t kMaxDnsCacheEntries = 2048;
+std::unordered_map<std::string, uint32_t> g_hostToFakeIp; // lowercased host -> host-order IPv4
+std::unordered_map<uint32_t, std::string> g_fakeIpToHost; // host-order IPv4 -> original host
+std::unordered_map<std::string, std::string> g_ipToHost;  // fallback passive cache
+std::unordered_set<void*> g_syntheticAddrInfos;
+uint32_t g_nextFakeIp = 0xC6120001u; // 198.18.0.1
+constexpr uint32_t kFakeIpStart = 0xC6120001u; // 198.18.0.1
+constexpr uint32_t kFakeIpEnd   = 0xC613FFFEu; // 198.19.255.254
+
+// Track WSAEventSelect FD_CONNECT registrations (Chromium TCPSocketWin requires connect()
+// on a WSAEventSelect socket to return SOCKET_ERROR + WSAEWOULDBLOCK, otherwise it hits NOTREACHED())
+struct EventSelectInfo {
+    WSAEVENT hEvent = nullptr;
+    long lNetworkEvents = 0;
+};
+std::mutex g_eventMutex;
+std::unordered_map<SOCKET, EventSelectInfo> g_socketEvents;
+std::unordered_map<SOCKET, bool> g_pendingConnectSuccess;
 
 std::string WideToUtf8(const wchar_t* ws) {
     if (!ws || !*ws) return {};
@@ -49,6 +70,13 @@ std::string WideToUtf8(const wchar_t* ws) {
     return out;
 }
 
+std::string ToLowerStr(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
 bool IsIpLiteral(const std::string& host) {
     in_addr v4 = {};
     in6_addr v6 = {};
@@ -56,58 +84,83 @@ bool IsIpLiteral(const std::string& host) {
            inet_pton(AF_INET6, host.c_str(), &v6) == 1;
 }
 
-void RecordDnsMapping(const std::string& host, const addrinfo* res) {
-    if (host.empty() || IsIpLiteral(host)) return;
-    std::lock_guard<std::mutex> lock(g_dnsMutex);
-    if (g_ipToHost.size() > kMaxDnsCacheEntries) {
-        g_ipToHost.clear();
+bool ShouldUseFakeIpForHost(const std::string& host, const Config& cfg) {
+    if (!cfg.enabled || !cfg.remote_dns) return false;
+    if (host.empty() || host.size() > 253) return false;
+    if (IsIpLiteral(host)) return false;
+
+    std::string lower = ToLowerStr(host);
+    if (lower == "localhost" || lower == "localhost.localdomain") return false;
+    if (lower == ToLowerStr(cfg.host)) return false;
+    if (lower.size() > 6 && lower.compare(lower.size() - 6, 6, ".local") == 0) return false;
+    if (lower.size() > 10 && lower.compare(lower.size() - 10, 10, ".localhost") == 0) return false;
+    // Must contain at least one dot (avoid single-label NetBIOS/intranet names)
+    if (lower.find('.') == std::string::npos) return false;
+    return true;
+}
+
+uint32_t AllocateFakeIpLocked(const std::string& host) {
+    std::string key = ToLowerStr(host);
+    auto it = g_hostToFakeIp.find(key);
+    if (it != g_hostToFakeIp.end()) {
+        return it->second;
     }
-    for (const addrinfo* p = res; p != nullptr; p = p->ai_next) {
-        if (p->ai_addr && (p->ai_family == AF_INET || p->ai_family == AF_INET6)) {
-            std::string ip = ExtractIpKey(p->ai_addr);
-            if (!ip.empty()) {
-                g_ipToHost[ip] = host;
+    uint32_t ip = g_nextFakeIp++;
+    if (g_nextFakeIp > kFakeIpEnd) {
+        g_nextFakeIp = kFakeIpStart;
+    }
+    g_hostToFakeIp[key] = ip;
+    g_fakeIpToHost[ip] = host;
+    return ip;
+}
+
+uint16_t ParseServicePortA(PCSTR svc) {
+    if (!svc || !*svc) return 0;
+    char* end = nullptr;
+    unsigned long p = std::strtoul(svc, &end, 10);
+    if (end && *end == '\0' && p <= 65535) {
+        return static_cast<uint16_t>(p);
+    }
+    std::string l = ToLowerStr(svc);
+    if (l == "https") return 443;
+    if (l == "http") return 80;
+    return 0;
+}
+
+uint16_t ParseServicePortW(PCWSTR svc) {
+    if (!svc || !*svc) return 0;
+    return ParseServicePortA(WideToUtf8(svc).c_str());
+}
+
+std::string LookupTargetDomain(const sockaddr* addr) {
+    if (!addr || !GetConfig().remote_dns) return {};
+
+    if (addr->sa_family == AF_INET) {
+        const auto* sin = reinterpret_cast<const sockaddr_in*>(addr);
+        uint32_t hostOrder = ntohl(sin->sin_addr.s_addr);
+        if (hostOrder >= kFakeIpStart && hostOrder <= kFakeIpEnd) {
+            std::lock_guard<std::mutex> lock(g_dnsMutex);
+            auto it = g_fakeIpToHost.find(hostOrder);
+            if (it != g_fakeIpToHost.end()) {
+                return it->second;
+            }
+        }
+    } else if (addr->sa_family == AF_INET6) {
+        const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(addr);
+        if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+            uint32_t netOrder = 0;
+            std::memcpy(&netOrder, &sin6->sin6_addr.s6_bytes[12], 4);
+            uint32_t hostOrder = ntohl(netOrder);
+            if (hostOrder >= kFakeIpStart && hostOrder <= kFakeIpEnd) {
+                std::lock_guard<std::mutex> lock(g_dnsMutex);
+                auto it = g_fakeIpToHost.find(hostOrder);
+                if (it != g_fakeIpToHost.end()) {
+                    return it->second;
+                }
             }
         }
     }
-}
 
-void RecordDnsMappingW(const std::wstring& hostW, const addrinfoW* res) {
-    std::string host = WideToUtf8(hostW.c_str());
-    if (host.empty() || IsIpLiteral(host)) return;
-    std::lock_guard<std::mutex> lock(g_dnsMutex);
-    if (g_ipToHost.size() > kMaxDnsCacheEntries) {
-        g_ipToHost.clear();
-    }
-    for (const addrinfoW* p = res; p != nullptr; p = p->ai_next) {
-        if (p->ai_addr && (p->ai_family == AF_INET || p->ai_family == AF_INET6)) {
-            std::string ip = ExtractIpKey(p->ai_addr);
-            if (!ip.empty()) {
-                g_ipToHost[ip] = host;
-            }
-        }
-    }
-}
-
-void RecordDnsMappingExW(const std::wstring& hostW, const ADDRINFOEXW* res) {
-    std::string host = WideToUtf8(hostW.c_str());
-    if (host.empty() || IsIpLiteral(host)) return;
-    std::lock_guard<std::mutex> lock(g_dnsMutex);
-    if (g_ipToHost.size() > kMaxDnsCacheEntries) {
-        g_ipToHost.clear();
-    }
-    for (const ADDRINFOEXW* p = res; p != nullptr; p = p->ai_next) {
-        if (p->ai_addr && (p->ai_family == AF_INET || p->ai_family == AF_INET6)) {
-            std::string ip = ExtractIpKey(p->ai_addr);
-            if (!ip.empty()) {
-                g_ipToHost[ip] = host;
-            }
-        }
-    }
-}
-
-std::string LookupCachedHost(const sockaddr* addr) {
-    if (!GetConfig().remote_dns) return {};
     std::string ip = ExtractIpKey(addr);
     if (ip.empty()) return {};
     std::lock_guard<std::mutex> lock(g_dnsMutex);
@@ -133,6 +186,12 @@ using WSASendToFnPtr = int (WSAAPI*)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, co
 using GetAddrInfoAFnPtr = int (WSAAPI*)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*);
 using GetAddrInfoWFnPtr = int (WSAAPI*)(PCWSTR, PCWSTR, const ADDRINFOW*, PADDRINFOW*);
 using GetAddrInfoExWFnPtr = int (WSAAPI*)(PCWSTR, PCWSTR, DWORD, LPGUID, const ADDRINFOEXW*, PADDRINFOEXW*, timeval*, LPOVERLAPPED, LPLOOKUPSERVICE_COMPLETION_ROUTINE, LPHANDLE);
+using FreeAddrInfoAFnPtr = void (WSAAPI*)(PADDRINFOA);
+using FreeAddrInfoWFnPtr = void (WSAAPI*)(PADDRINFOW);
+using FreeAddrInfoExWFnPtr = void (WSAAPI*)(PADDRINFOEXW);
+using WSAEventSelectFnPtr = int (WSAAPI*)(SOCKET, WSAEVENT, long);
+using WSAEnumNetworkEventsFnPtr = int (WSAAPI*)(SOCKET, WSAEVENT, LPWSANETWORKEVENTS);
+using CloseSocketFnPtr = int (WSAAPI*)(SOCKET);
 
 ConnectFnPtr g_origConnect = nullptr;
 WSAConnectFnPtr g_origWSAConnect = nullptr;
@@ -142,37 +201,90 @@ WSASendToFnPtr g_origWSASendTo = nullptr;
 GetAddrInfoAFnPtr g_origGetAddrInfoA = nullptr;
 GetAddrInfoWFnPtr g_origGetAddrInfoW = nullptr;
 GetAddrInfoExWFnPtr g_origGetAddrInfoExW = nullptr;
+FreeAddrInfoAFnPtr g_origFreeAddrInfoA = nullptr;
+FreeAddrInfoWFnPtr g_origFreeAddrInfoW = nullptr;
+FreeAddrInfoExWFnPtr g_origFreeAddrInfoExW = nullptr;
+WSAEventSelectFnPtr g_origWSAEventSelect = nullptr;
+WSAEnumNetworkEventsFnPtr g_origWSAEnumNetworkEvents = nullptr;
+CloseSocketFnPtr g_origCloseSocket = nullptr;
 LPFN_CONNECTEX g_origConnectEx = nullptr;
+
+// If the socket has an active WSAEventSelect(..., FD_CONNECT) (as Chromium's TCPSocketWin does),
+// signal the event and return SOCKET_ERROR + WSAEWOULDBLOCK so Chromium doesn't hit NOTREACHED().
+int FinalizeProxyConnectResult(SOCKET s, int rc) {
+    if (rc != 0) {
+        return rc;
+    }
+
+    WSAEVENT connectEvent = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_eventMutex);
+        auto it = g_socketEvents.find(s);
+        if (it != g_socketEvents.end() && it->second.hEvent != nullptr &&
+            (it->second.lNetworkEvents & FD_CONNECT) != 0) {
+            connectEvent = it->second.hEvent;
+            g_pendingConnectSuccess[s] = true;
+        }
+    }
+
+    if (connectEvent != nullptr) {
+        WSASetEvent(connectEvent);
+        WSASetLastError(WSAEWOULDBLOCK);
+        return SOCKET_ERROR;
+    }
+
+    return 0;
+}
+
+bool ShouldBlockUdpTarget(const sockaddr* to, int tolen, const Config& cfg) {
+    if (!cfg.enabled || !to) return false;
+    uint16_t port = ExtractPort(to);
+
+    // Block UDP port 53 (built-in Chromium async DNS) BEFORE LAN bypass so Chromium falls back
+    // to OS GetAddrInfoW -> our Fake-IP resolver, preventing local ISP DNS poisoning.
+    if (cfg.remote_dns && port == 53) {
+        LogDebug("Blocked UDP DNS -> %s (forcing OS GetAddrInfoW fallback)", FormatSockAddr(to).c_str());
+        return true;
+    }
+
+    // Block UDP port 443 (QUIC / HTTP3) on non-LAN targets so Chromium falls back to TCP over proxy
+    if (cfg.block_quic && port == 443 && !ShouldBypassAddress(to, tolen, cfg)) {
+        LogDebug("Blocked QUIC UDP -> %s", FormatSockAddr(to).c_str());
+        return true;
+    }
+
+    return false;
+}
 
 int WSAAPI DetourConnect(SOCKET s, const sockaddr* name, int namelen) {
     HookGuard guard;
     const Config& cfg = GetConfig();
-    if (!guard.entered || !cfg.enabled || ShouldBypassAddress(name, namelen, cfg)) {
+    if (!guard.entered || !cfg.enabled) {
         return g_origConnect(s, name, namelen);
     }
 
     int sockType = GetSocketType(s);
     if (sockType == SOCK_DGRAM) {
-        if (cfg.block_quic && ExtractPort(name) == 443) {
-            LogDebug("Blocked QUIC UDP connect -> %s", FormatSockAddr(name).c_str());
+        if (ShouldBlockUdpTarget(name, namelen, cfg)) {
             WSASetLastError(WSAECONNREFUSED);
             return SOCKET_ERROR;
         }
         return g_origConnect(s, name, namelen);
     }
 
-    if (sockType != SOCK_STREAM) {
+    if (sockType != SOCK_STREAM || ShouldBypassAddress(name, namelen, cfg)) {
         return g_origConnect(s, name, namelen);
     }
 
-    std::string domain = LookupCachedHost(name);
+    std::string domain = LookupTargetDomain(name);
     LogDebug("connect -> %s%s%s via %s:%u",
              FormatSockAddr(name).c_str(),
              domain.empty() ? "" : " (",
              domain.empty() ? "" : (domain + ")").c_str(),
              cfg.host.c_str(), cfg.port);
 
-    return ConnectViaProxy(s, name, namelen, domain, cfg, g_origConnect);
+    int rc = ConnectViaProxy(s, name, namelen, domain, cfg, g_origConnect);
+    return FinalizeProxyConnectResult(s, rc);
 }
 
 int WSAAPI DetourWSAConnect(SOCKET s, const sockaddr* name, int namelen,
@@ -180,32 +292,32 @@ int WSAAPI DetourWSAConnect(SOCKET s, const sockaddr* name, int namelen,
                             LPQOS lpSQOS, LPQOS lpGQOS) {
     HookGuard guard;
     const Config& cfg = GetConfig();
-    if (!guard.entered || !cfg.enabled || ShouldBypassAddress(name, namelen, cfg)) {
+    if (!guard.entered || !cfg.enabled) {
         return g_origWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
     }
 
     int sockType = GetSocketType(s);
     if (sockType == SOCK_DGRAM) {
-        if (cfg.block_quic && ExtractPort(name) == 443) {
-            LogDebug("Blocked QUIC UDP WSAConnect -> %s", FormatSockAddr(name).c_str());
+        if (ShouldBlockUdpTarget(name, namelen, cfg)) {
             WSASetLastError(WSAECONNREFUSED);
             return SOCKET_ERROR;
         }
         return g_origWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
     }
 
-    if (sockType != SOCK_STREAM) {
+    if (sockType != SOCK_STREAM || ShouldBypassAddress(name, namelen, cfg)) {
         return g_origWSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
     }
 
-    std::string domain = LookupCachedHost(name);
+    std::string domain = LookupTargetDomain(name);
     LogDebug("WSAConnect -> %s%s%s via %s:%u",
              FormatSockAddr(name).c_str(),
              domain.empty() ? "" : " (",
              domain.empty() ? "" : (domain + ")").c_str(),
              cfg.host.c_str(), cfg.port);
 
-    return ConnectViaProxy(s, name, namelen, domain, cfg, g_origConnect);
+    int rc = ConnectViaProxy(s, name, namelen, domain, cfg, g_origConnect);
+    return FinalizeProxyConnectResult(s, rc);
 }
 
 BOOL PASCAL DetourConnectEx(SOCKET s, const sockaddr* name, int namelen,
@@ -217,7 +329,7 @@ BOOL PASCAL DetourConnectEx(SOCKET s, const sockaddr* name, int namelen,
         return g_origConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
     }
 
-    std::string domain = LookupCachedHost(name);
+    std::string domain = LookupTargetDomain(name);
     LogDebug("ConnectEx -> %s%s%s via %s:%u",
              FormatSockAddr(name).c_str(),
              domain.empty() ? "" : " (",
@@ -229,7 +341,6 @@ BOOL PASCAL DetourConnectEx(SOCKET s, const sockaddr* name, int namelen,
     }
 
     // Complete the caller's OVERLAPPED / IOCP cleanly via a real overlapped WSASend
-    // (0-byte WSASend when dwSendDataLength == 0 so libuv/IOCP receives the kernel completion packet)
     WSABUF wsaBuf = {};
     wsaBuf.buf = (dwSendDataLength > 0) ? reinterpret_cast<CHAR*>(lpSendBuffer) : nullptr;
     wsaBuf.len = dwSendDataLength;
@@ -242,7 +353,6 @@ BOOL PASCAL DetourConnectEx(SOCKET s, const sockaddr* name, int namelen,
     if (rc == 0) {
         return TRUE;
     }
-    // WSA_IO_PENDING is expected for async IOCP completion; caller checks GetLastError()
     return FALSE;
 }
 
@@ -277,12 +387,9 @@ int WSAAPI DetourWSAIoctl(SOCKET s, DWORD dwIoControlCode,
 int WSAAPI DetourSendTo(SOCKET s, const char* buf, int len, int flags,
                         const sockaddr* to, int tolen) {
     const Config& cfg = GetConfig();
-    if (cfg.enabled && cfg.block_quic && to && !ShouldBypassAddress(to, tolen, cfg)) {
-        if (ExtractPort(to) == 443) {
-            LogDebug("Blocked QUIC UDP sendto -> %s", FormatSockAddr(to).c_str());
-            WSASetLastError(WSAECONNREFUSED);
-            return SOCKET_ERROR;
-        }
+    if (ShouldBlockUdpTarget(to, tolen, cfg)) {
+        WSASetLastError(WSAECONNREFUSED);
+        return SOCKET_ERROR;
     }
     return g_origSendTo(s, buf, len, flags, to, tolen);
 }
@@ -293,12 +400,9 @@ int WSAAPI DetourWSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
                            LPWSAOVERLAPPED lpOverlapped,
                            LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
     const Config& cfg = GetConfig();
-    if (cfg.enabled && cfg.block_quic && lpTo && !ShouldBypassAddress(lpTo, iTolen, cfg)) {
-        if (ExtractPort(lpTo) == 443) {
-            LogDebug("Blocked QUIC UDP WSASendTo -> %s", FormatSockAddr(lpTo).c_str());
-            WSASetLastError(WSAECONNREFUSED);
-            return SOCKET_ERROR;
-        }
+    if (ShouldBlockUdpTarget(lpTo, iTolen, cfg)) {
+        WSASetLastError(WSAECONNREFUSED);
+        return SOCKET_ERROR;
     }
     return g_origWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags,
                            lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
@@ -306,20 +410,76 @@ int WSAAPI DetourWSASendTo(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
 
 int WSAAPI DetourGetAddrInfoA(PCSTR pNodeName, PCSTR pServiceName,
                               const ADDRINFOA* pHints, PADDRINFOA* ppResult) {
-    int rc = g_origGetAddrInfoA(pNodeName, pServiceName, pHints, ppResult);
-    if (rc == 0 && pNodeName && ppResult && *ppResult) {
-        RecordDnsMapping(pNodeName, *ppResult);
+    const Config& cfg = GetConfig();
+    if (pNodeName && ppResult &&
+        (!pHints || ((pHints->ai_flags & AI_NUMERICHOST) == 0 &&
+                     (pHints->ai_family == AF_UNSPEC || pHints->ai_family == AF_INET))) &&
+        ShouldUseFakeIpForHost(pNodeName, cfg)) {
+        uint32_t fakeIp = 0;
+        auto* ai = new ADDRINFOA{};
+        auto* sin = new sockaddr_in{};
+        {
+            std::lock_guard<std::mutex> lock(g_dnsMutex);
+            fakeIp = AllocateFakeIpLocked(pNodeName);
+            g_syntheticAddrInfos.insert(ai);
+        }
+        sin->sin_family = AF_INET;
+        sin->sin_addr.s_addr = htonl(fakeIp);
+        sin->sin_port = htons(ParseServicePortA(pServiceName));
+
+        ai->ai_family = AF_INET;
+        ai->ai_socktype = (pHints && pHints->ai_socktype) ? pHints->ai_socktype : SOCK_STREAM;
+        ai->ai_protocol = (pHints && pHints->ai_protocol) ? pHints->ai_protocol : IPPROTO_TCP;
+        ai->ai_addrlen = sizeof(sockaddr_in);
+        ai->ai_addr = reinterpret_cast<sockaddr*>(sin);
+        if (pHints && (pHints->ai_flags & AI_CANONNAME)) {
+            size_t len = std::strlen(pNodeName);
+            ai->ai_canonname = new char[len + 1];
+            std::memcpy(ai->ai_canonname, pNodeName, len + 1);
+        }
+        *ppResult = ai;
+        LogDebug("FakeIP getaddrinfo(%s) -> %s", pNodeName, ExtractIpKey(ai->ai_addr).c_str());
+        return 0;
     }
-    return rc;
+    return g_origGetAddrInfoA(pNodeName, pServiceName, pHints, ppResult);
 }
 
 int WSAAPI DetourGetAddrInfoW(PCWSTR pNodeName, PCWSTR pServiceName,
                               const ADDRINFOW* pHints, PADDRINFOW* ppResult) {
-    int rc = g_origGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
-    if (rc == 0 && pNodeName && ppResult && *ppResult) {
-        RecordDnsMappingW(pNodeName, *ppResult);
+    const Config& cfg = GetConfig();
+    if (pNodeName && ppResult &&
+        (!pHints || ((pHints->ai_flags & AI_NUMERICHOST) == 0 &&
+                     (pHints->ai_family == AF_UNSPEC || pHints->ai_family == AF_INET)))) {
+        std::string host = WideToUtf8(pNodeName);
+        if (ShouldUseFakeIpForHost(host, cfg)) {
+            uint32_t fakeIp = 0;
+            auto* ai = new ADDRINFOW{};
+            auto* sin = new sockaddr_in{};
+            {
+                std::lock_guard<std::mutex> lock(g_dnsMutex);
+                fakeIp = AllocateFakeIpLocked(host);
+                g_syntheticAddrInfos.insert(ai);
+            }
+            sin->sin_family = AF_INET;
+            sin->sin_addr.s_addr = htonl(fakeIp);
+            sin->sin_port = htons(ParseServicePortW(pServiceName));
+
+            ai->ai_family = AF_INET;
+            ai->ai_socktype = (pHints && pHints->ai_socktype) ? pHints->ai_socktype : SOCK_STREAM;
+            ai->ai_protocol = (pHints && pHints->ai_protocol) ? pHints->ai_protocol : IPPROTO_TCP;
+            ai->ai_addrlen = sizeof(sockaddr_in);
+            ai->ai_addr = reinterpret_cast<sockaddr*>(sin);
+            if (pHints && (pHints->ai_flags & AI_CANONNAME)) {
+                size_t len = wcslen(pNodeName);
+                ai->ai_canonname = new wchar_t[len + 1];
+                std::memcpy(ai->ai_canonname, pNodeName, (len + 1) * sizeof(wchar_t));
+            }
+            *ppResult = ai;
+            LogDebug("FakeIP GetAddrInfoW(%s) -> %s", host.c_str(), ExtractIpKey(ai->ai_addr).c_str());
+            return 0;
+        }
     }
-    return rc;
+    return g_origGetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
 }
 
 int WSAAPI DetourGetAddrInfoExW(PCWSTR pName, PCWSTR pServiceName, DWORD dwNameSpace,
@@ -327,12 +487,138 @@ int WSAAPI DetourGetAddrInfoExW(PCWSTR pName, PCWSTR pServiceName, DWORD dwNameS
                                 timeval* timeout, LPOVERLAPPED lpOverlapped,
                                 LPLOOKUPSERVICE_COMPLETION_ROUTINE lpCompletionRoutine,
                                 LPHANDLE lpHandle) {
-    int rc = g_origGetAddrInfoExW(pName, pServiceName, dwNameSpace, lpNspId, hints, ppResult,
-                                  timeout, lpOverlapped, lpCompletionRoutine, lpHandle);
-    if (rc == 0 && pName && ppResult && *ppResult) {
-        RecordDnsMappingExW(pName, *ppResult);
+    const Config& cfg = GetConfig();
+    if (pName && ppResult && lpOverlapped == nullptr && lpCompletionRoutine == nullptr &&
+        (!hints || ((hints->ai_flags & AI_NUMERICHOST) == 0 &&
+                    (hints->ai_family == AF_UNSPEC || hints->ai_family == AF_INET)))) {
+        std::string host = WideToUtf8(pName);
+        if (ShouldUseFakeIpForHost(host, cfg)) {
+            uint32_t fakeIp = 0;
+            auto* ai = new ADDRINFOEXW{};
+            auto* sin = new sockaddr_in{};
+            {
+                std::lock_guard<std::mutex> lock(g_dnsMutex);
+                fakeIp = AllocateFakeIpLocked(host);
+                g_syntheticAddrInfos.insert(ai);
+            }
+            sin->sin_family = AF_INET;
+            sin->sin_addr.s_addr = htonl(fakeIp);
+            sin->sin_port = htons(ParseServicePortW(pServiceName));
+
+            ai->ai_family = AF_INET;
+            ai->ai_socktype = (hints && hints->ai_socktype) ? hints->ai_socktype : SOCK_STREAM;
+            ai->ai_protocol = (hints && hints->ai_protocol) ? hints->ai_protocol : IPPROTO_TCP;
+            ai->ai_addrlen = sizeof(sockaddr_in);
+            ai->ai_addr = reinterpret_cast<sockaddr*>(sin);
+            if (hints && (hints->ai_flags & AI_CANONNAME)) {
+                size_t len = wcslen(pName);
+                ai->ai_canonname = new wchar_t[len + 1];
+                std::memcpy(ai->ai_canonname, pName, (len + 1) * sizeof(wchar_t));
+            }
+            *ppResult = ai;
+            LogDebug("FakeIP GetAddrInfoExW(%s) -> %s", host.c_str(), ExtractIpKey(ai->ai_addr).c_str());
+            return 0;
+        }
+    }
+    return g_origGetAddrInfoExW(pName, pServiceName, dwNameSpace, lpNspId, hints, ppResult,
+                                timeout, lpOverlapped, lpCompletionRoutine, lpHandle);
+}
+
+void WSAAPI DetourFreeAddrInfoA(PADDRINFOA pAddrInfo) {
+    if (pAddrInfo) {
+        bool isSynthetic = false;
+        {
+            std::lock_guard<std::mutex> lock(g_dnsMutex);
+            isSynthetic = (g_syntheticAddrInfos.erase(pAddrInfo) > 0);
+        }
+        if (isSynthetic) {
+            delete reinterpret_cast<sockaddr_in*>(pAddrInfo->ai_addr);
+            delete[] pAddrInfo->ai_canonname;
+            delete pAddrInfo;
+            return;
+        }
+    }
+    g_origFreeAddrInfoA(pAddrInfo);
+}
+
+void WSAAPI DetourFreeAddrInfoW(PADDRINFOW pAddrInfo) {
+    if (pAddrInfo) {
+        bool isSynthetic = false;
+        {
+            std::lock_guard<std::mutex> lock(g_dnsMutex);
+            isSynthetic = (g_syntheticAddrInfos.erase(pAddrInfo) > 0);
+        }
+        if (isSynthetic) {
+            delete reinterpret_cast<sockaddr_in*>(pAddrInfo->ai_addr);
+            delete[] pAddrInfo->ai_canonname;
+            delete pAddrInfo;
+            return;
+        }
+    }
+    g_origFreeAddrInfoW(pAddrInfo);
+}
+
+void WSAAPI DetourFreeAddrInfoExW(PADDRINFOEXW pAddrInfo) {
+    if (pAddrInfo) {
+        bool isSynthetic = false;
+        {
+            std::lock_guard<std::mutex> lock(g_dnsMutex);
+            isSynthetic = (g_syntheticAddrInfos.erase(pAddrInfo) > 0);
+        }
+        if (isSynthetic) {
+            delete reinterpret_cast<sockaddr_in*>(pAddrInfo->ai_addr);
+            delete[] pAddrInfo->ai_canonname;
+            delete pAddrInfo;
+            return;
+        }
+    }
+    g_origFreeAddrInfoExW(pAddrInfo);
+}
+
+int WSAAPI DetourWSAEventSelect(SOCKET s, WSAEVENT hEventObject, long lNetworkEvents) {
+    int rc = g_origWSAEventSelect(s, hEventObject, lNetworkEvents);
+    if (rc == 0) {
+        std::lock_guard<std::mutex> lock(g_eventMutex);
+        if (hEventObject == nullptr || lNetworkEvents == 0) {
+            g_socketEvents.erase(s);
+            g_pendingConnectSuccess.erase(s);
+        } else {
+            g_socketEvents[s] = EventSelectInfo{hEventObject, lNetworkEvents};
+        }
     }
     return rc;
+}
+
+int WSAAPI DetourWSAEnumNetworkEvents(SOCKET s, WSAEVENT hEventObject, LPWSANETWORKEVENTS lpNetworkEvents) {
+    int rc = g_origWSAEnumNetworkEvents(s, hEventObject, lpNetworkEvents);
+    if (rc == 0 && lpNetworkEvents) {
+        bool injectConnect = false;
+        {
+            std::lock_guard<std::mutex> lock(g_eventMutex);
+            auto it = g_pendingConnectSuccess.find(s);
+            if (it != g_pendingConnectSuccess.end()) {
+                injectConnect = true;
+                g_pendingConnectSuccess.erase(it);
+            }
+        }
+        if (injectConnect) {
+            lpNetworkEvents->lNetworkEvents |= FD_CONNECT;
+            lpNetworkEvents->iErrorCode[FD_CONNECT_BIT] = 0;
+            if (hEventObject) {
+                WSAResetEvent(hEventObject);
+            }
+        }
+    }
+    return rc;
+}
+
+int WSAAPI DetourCloseSocket(SOCKET s) {
+    {
+        std::lock_guard<std::mutex> lock(g_eventMutex);
+        g_socketEvents.erase(s);
+        g_pendingConnectSuccess.erase(s);
+    }
+    return g_origCloseSocket(s);
 }
 
 template <typename FnPtr>
@@ -374,11 +660,17 @@ bool InstallHooks() {
     ok &= CreateHookByName(ws2, "WSAIoctl", reinterpret_cast<void*>(&DetourWSAIoctl), &g_origWSAIoctl);
     ok &= CreateHookByName(ws2, "sendto", reinterpret_cast<void*>(&DetourSendTo), &g_origSendTo);
     ok &= CreateHookByName(ws2, "WSASendTo", reinterpret_cast<void*>(&DetourWSASendTo), &g_origWSASendTo);
+    ok &= CreateHookByName(ws2, "WSAEventSelect", reinterpret_cast<void*>(&DetourWSAEventSelect), &g_origWSAEventSelect);
+    ok &= CreateHookByName(ws2, "WSAEnumNetworkEvents", reinterpret_cast<void*>(&DetourWSAEnumNetworkEvents), &g_origWSAEnumNetworkEvents);
+    ok &= CreateHookByName(ws2, "closesocket", reinterpret_cast<void*>(&DetourCloseSocket), &g_origCloseSocket);
 
-    // Passive DNS hooks (best-effort; non-fatal if absent)
+    // Fake-IP DNS hooks
     CreateHookByName(ws2, "getaddrinfo", reinterpret_cast<void*>(&DetourGetAddrInfoA), &g_origGetAddrInfoA);
     CreateHookByName(ws2, "GetAddrInfoW", reinterpret_cast<void*>(&DetourGetAddrInfoW), &g_origGetAddrInfoW);
     CreateHookByName(ws2, "GetAddrInfoExW", reinterpret_cast<void*>(&DetourGetAddrInfoExW), &g_origGetAddrInfoExW);
+    CreateHookByName(ws2, "freeaddrinfo", reinterpret_cast<void*>(&DetourFreeAddrInfoA), &g_origFreeAddrInfoA);
+    CreateHookByName(ws2, "FreeAddrInfoW", reinterpret_cast<void*>(&DetourFreeAddrInfoW), &g_origFreeAddrInfoW);
+    CreateHookByName(ws2, "FreeAddrInfoExW", reinterpret_cast<void*>(&DetourFreeAddrInfoExW), &g_origFreeAddrInfoExW);
 
     st = MH_EnableHook(MH_ALL_HOOKS);
     if (st != MH_OK) {
